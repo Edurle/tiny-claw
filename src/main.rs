@@ -1,6 +1,7 @@
 mod config;
 mod llm_client;
 mod mcp_client;
+mod skills;
 mod tool_runner;
 mod types;
 
@@ -9,9 +10,10 @@ use clap::Parser;
 use config::AppConfig;
 use futures::future::join_all;
 use llm_client::LlmClient;
+use skills::SkillManager;
+use std::path::PathBuf;
 use tool_runner::ToolRegistry;
-use types::ToolCall;
-use types::ChatMessage;
+use types::{ChatMessage, ToolCall};
 
 #[derive(Parser)]
 #[command(name = "tiny-claw", about = "A minimal agent CLI")]
@@ -23,7 +25,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -34,6 +35,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load(cli.config.as_deref())?;
     let api_key = config.api_key()?;
+
+    // Load skills
+    let skills_dir = PathBuf::from(&config.skills.dir);
+    let mut skill_mgr = SkillManager::load(&skills_dir)?;
+    let skill_count = skill_mgr.list().len();
+    let enabled_count = skill_mgr.list().iter().filter(|(_, _, on)| *on).count();
+    if skill_count > 0 {
+        println!(
+            "Loaded {} skills ({} enabled).",
+            skill_count, enabled_count
+        );
+    }
 
     // Connect to MCP servers
     println!("Connecting to MCP servers...");
@@ -47,9 +60,11 @@ async fn main() -> Result<()> {
 
     let llm = LlmClient::new(&config.llm, api_key)?;
 
-    // Conversation history
+    // Build system prompt from skills
+    let base_prompt = "You are a helpful assistant. Use tools when needed.";
+    let system_content = skill_mgr.build_system_prompt(base_prompt);
     let mut conversation: Vec<ChatMessage> = vec![ChatMessage::System {
-        content: "You are a helpful assistant. Use tools when needed.".to_string(),
+        content: system_content,
     }];
 
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -87,7 +102,7 @@ async fn main() -> Result<()> {
                     break;
                 }
                 "/clear" => {
-                    conversation.truncate(1); // Keep system message
+                    rebuild_system_prompt(&mut conversation, &skill_mgr, base_prompt);
                     println!("Conversation cleared.");
                     continue;
                 }
@@ -103,16 +118,44 @@ async fn main() -> Result<()> {
                     }
                     continue;
                 }
+                "/skills" => {
+                    let skills = skill_mgr.list();
+                    if skills.is_empty() {
+                        println!("No skills loaded.");
+                    } else {
+                        println!("Skills:");
+                        for (name, desc, enabled) in skills {
+                            let status = if enabled { "ON" } else { "OFF" };
+                            if desc.is_empty() {
+                                println!("  [{}] {}", status, name);
+                            } else {
+                                println!("  [{}] {} - {}", status, name, desc);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 "/help" => {
                     println!("Commands:");
-                    println!("  /quit   - Exit the program");
-                    println!("  /clear  - Clear conversation history");
-                    println!("  /tools  - List available tools");
-                    println!("  /help   - Show this help");
+                    println!("  /quit          - Exit the program");
+                    println!("  /clear         - Clear conversation history");
+                    println!("  /tools         - List available tools");
+                    println!("  /skills        - List loaded skills");
+                    println!("  /skill on <n>  - Enable a skill");
+                    println!("  /skill off <n> - Disable a skill");
+                    println!("  /help          - Show this help");
                     continue;
                 }
                 _ => {
-                    println!("Unknown command: {}. Type /help for available commands.", trimmed);
+                    // Handle /skill on/off <name>
+                    if let Some(rest) = trimmed.strip_prefix("/skill ") {
+                        handle_skill_command(rest, &mut skill_mgr, &mut conversation, base_prompt);
+                        continue;
+                    }
+                    println!(
+                        "Unknown command: {}. Type /help for available commands.",
+                        trimmed
+                    );
                     continue;
                 }
             }
@@ -123,7 +166,7 @@ async fn main() -> Result<()> {
             content: trimmed.to_string(),
         });
 
-        // Agent loop: keep calling LLM until we get a final text response
+        // Agent loop
         loop {
             let tools_ref = if tools.is_empty() {
                 None
@@ -135,7 +178,6 @@ async fn main() -> Result<()> {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("Error: {}", e);
-                    // Remove the user message so we can retry
                     conversation.pop();
                     break;
                 }
@@ -169,13 +211,11 @@ async fn main() -> Result<()> {
                             );
                         }
 
-                        // Execute all tool calls in parallel
-                        let results: Vec<(ToolCall, std::result::Result<String, anyhow::Error>)> = join_all(
-                            calls.iter().map(|tc| async {
+                        let results: Vec<(ToolCall, std::result::Result<String, anyhow::Error>)> =
+                            join_all(calls.iter().map(|tc| async {
                                 (tc.clone(), registry.execute_tool_call(tc).await)
-                            }),
-                        )
-                        .await;
+                            }))
+                            .await;
 
                         for (tc, result) in results {
                             match result {
@@ -197,7 +237,6 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    // Loop back to call LLM with tool results
                     continue;
                 }
                 other => {
@@ -209,6 +248,56 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_skill_command(
+    rest: &str,
+    skill_mgr: &mut SkillManager,
+    conversation: &mut Vec<ChatMessage>,
+    base_prompt: &str,
+) {
+    let parts: Vec<&str> = rest.trim().splitn(2, |c: char| c.is_whitespace()).collect();
+    if parts.len() != 2 {
+        println!("Usage: /skill on <name> or /skill off <name>");
+        return;
+    }
+
+    let action = parts[0];
+    let name = parts[1];
+
+    let found = match action {
+        "on" => skill_mgr.enable(name),
+        "off" => skill_mgr.disable(name),
+        _ => {
+            println!("Usage: /skill on <name> or /skill off <name>");
+            return;
+        }
+    };
+
+    if !found {
+        println!("Skill '{}' not found.", name);
+        return;
+    }
+
+    rebuild_system_prompt(conversation, skill_mgr, base_prompt);
+    let status = if action == "on" { "enabled" } else { "disabled" };
+    println!("Skill '{}' {}.", name, status);
+}
+
+fn rebuild_system_prompt(
+    conversation: &mut Vec<ChatMessage>,
+    skill_mgr: &SkillManager,
+    base_prompt: &str,
+) {
+    let new_prompt = skill_mgr.build_system_prompt(base_prompt);
+    if !conversation.is_empty() {
+        if let ChatMessage::System { content } = &mut conversation[0] {
+            *content = new_prompt;
+        }
+    } else {
+        conversation.push(ChatMessage::System { content: new_prompt });
+    }
+    conversation.truncate(1);
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

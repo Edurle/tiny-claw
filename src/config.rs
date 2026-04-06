@@ -7,6 +7,28 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SkillsConfig {
+    #[serde(default = "default_skills_dir")]
+    pub dir: String,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_skills_dir(),
+        }
+    }
+}
+
+fn default_skills_dir() -> String {
+    dirs::config_dir()
+        .map(|p| p.join("tiny-claw").join("skills").to_string_lossy().to_string())
+        .unwrap_or_else(|| "~/.config/tiny-claw/skills".to_string())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
